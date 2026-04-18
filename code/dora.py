@@ -22,7 +22,7 @@ class DoRA(nn.Module):
         self.register_buffer("W_dir", W_norm)
 
         # magnitude so W_dir * m == W per row at init (m = row L2 norm)
-        self.magnitude = nn.Parameter(row_norm.squeeze().clone())  # (output_dim,)
+        self.magnitude = nn.Parameter(row_norm.clone())  # (output_dim,)
 
         # One low-rank matrix initialized as zeros, the other initialized randomly
         self.A = nn.Parameter(torch.zeros([self.out_dim, self.rank])) # (output_dim, rank)
