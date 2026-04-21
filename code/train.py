@@ -124,7 +124,7 @@ class AdaptedLinear(nn.Module):
                 p=dropout,
                 alpha=alpha
             )
-        elif method == "dora_paper":
+        elif method == "dora2":
             self.adapter = DoRAPaper(
                 W=W,
                 rank=rank,
@@ -132,7 +132,7 @@ class AdaptedLinear(nn.Module):
                 alpha=alpha
             )
         else:
-            raise ValueError("method must be 'lora' or 'dora'")
+            raise ValueError("method must be 'lora' or 'dora' or 'dora2'")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.adapter(x)
