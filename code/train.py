@@ -17,6 +17,9 @@ from transformers import (
 
 from lora import LoRA
 from dora import DoRA
+from dora2 import DoRAPaper
+
+import time
 
 
 # ============================================================
@@ -34,7 +37,7 @@ def parse_args():
 
     # model / save
     parser.add_argument("--model_name", type=str, default="roberta-base")
-    parser.add_argument("--method", type=str, choices=["lora", "dora"], default="dora")
+    parser.add_argument("--method", type=str, choices=["lora", "dora", "dora2"], default="dora")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -116,6 +119,13 @@ class AdaptedLinear(nn.Module):
             )
         elif method == "dora":
             self.adapter = DoRA(
+                W=W,
+                rank=rank,
+                p=dropout,
+                alpha=alpha
+            )
+        elif method == "dora_paper":
+            self.adapter = DoRAPaper(
                 W=W,
                 rank=rank,
                 p=dropout,
@@ -395,6 +405,7 @@ def train_one_epoch(
 ):
     model.train()
     running_loss = 0.0
+    epoch_loss_sum = 0.0
 
     for step, batch in enumerate(train_loader, start=1):
         input_ids = batch.input_ids.to(device)
@@ -414,11 +425,15 @@ def train_one_epoch(
         scheduler.step()
 
         running_loss += loss.item()
+        epoch_loss_sum += loss.item()
 
         if step % args.log_every == 0:
             avg_loss = running_loss / args.log_every
             print(f"epoch {epoch} | step {step}/{len(train_loader)} | loss {avg_loss:.4f}")
             running_loss = 0.0
+
+    print(f"Epoch {epoch} | Average Loss: {epoch_loss_sum / len(train_loader):.4f}")
+    return epoch_loss_sum / len(train_loader)
 
 
 # ============================================================
@@ -513,8 +528,12 @@ def main():
     # --------------------
     # Train
     # --------------------
+    total_train_start = time.time()
+
     for epoch in range(start_epoch, args.epochs + 1):
-        train_one_epoch(
+        epoch_start_time = time.time()
+
+        epoch_avg_loss = train_one_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
@@ -524,7 +543,16 @@ def main():
             args=args,
         )
 
+        epoch_time_sec = time.time() - epoch_start_time
         global_step += len(train_loader)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        print(f"\n=== Epoch {epoch} Summary ===")
+        print(f"Average loss: {epoch_avg_loss:.4f}")
+        print(f"Epoch time: {epoch_time_sec:.2f} sec ({epoch_time_sec / 60:.2f} min)")
+        print(f"Learning rate: {current_lr:.8f}")
+        print(f"Global steps completed: {global_step}\n")
 
         if args.save_every_epoch:
             epoch_ckpt = os.path.join(args.save_dir, f"{args.method}_epoch_{epoch}.pt")
@@ -539,18 +567,8 @@ def main():
             )
             print(f"Saved checkpoint to {epoch_ckpt}")
 
-    final_ckpt = os.path.join(args.save_dir, f"{args.method}_final.pt")
-    save_checkpoint(
-        path=final_ckpt,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        epoch=args.epochs,
-        step=global_step,
-        args=args,
-    )
-    print(f"Saved final checkpoint to {final_ckpt}")
-
+    total_train_time_sec = time.time() - total_train_start
+    print(f"\nTotal training time: {total_train_time_sec:.2f} sec ({total_train_time_sec / 60:.2f} min)")
 
 if __name__ == "__main__":
     main()
