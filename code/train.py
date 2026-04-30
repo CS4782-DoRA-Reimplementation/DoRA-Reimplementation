@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
 
     # data / training
+    parser.add_argument("--dataset", type=str, choices=["boolq", "hellaswag", "piqa"], default="boolq")
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=3)
@@ -484,10 +485,13 @@ def main():
     # --------------------
     # Load datasets
     # --------------------
-    print("Loading BoolQ...")
-    boolq_train = MultiChoiceDataset(load_boolq_examples("train"))
-
-    train_dataset = boolq_train
+    print(f"Loading {args.dataset}...")
+    if args.dataset == "boolq":
+        train_dataset = MultiChoiceDataset(load_boolq_examples("train"))
+    elif args.dataset == "hellaswag":
+        train_dataset = MultiChoiceDataset(load_hellaswag_examples("train"))
+    elif args.dataset == "piqa":
+        train_dataset = MultiChoiceDataset(load_piqa_examples("train"))
 
     train_loader = DataLoader(
         train_dataset,
