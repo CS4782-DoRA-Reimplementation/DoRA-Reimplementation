@@ -15,10 +15,10 @@ class LoRA(nn.Module):
         self.alpha = alpha
         self.out_dim, self.in_dim = W.shape
 
-        # ---- LoRA low-rank factors ----
-        # One low-rank matrix initialized as zeros, the other initialized randomly
-        self.A = nn.Parameter(torch.zeros([self.out_dim, self.rank]))  # (output_dim, rank)
-        self.B = nn.Parameter(torch.randn([self.rank, self.in_dim]) * 0.01)  # (rank, input_dim)
+        # B ∈ R^(d×r) zeros, A ∈ R^(r×k) Kaiming uniform — paper Section 4.1
+        self.B = nn.Parameter(torch.zeros([self.out_dim, self.rank]))  # (output_dim, rank)
+        self.A = nn.Parameter(torch.empty([self.rank, self.in_dim]))   # (rank, input_dim)
+        nn.init.kaiming_uniform_(self.A, a=5 ** 0.5)
 
         self.lora_dropout = nn.Dropout(self.p)
 
@@ -27,8 +27,7 @@ class LoRA(nn.Module):
         base = x @ self.W.T  # (batch, input_dim) @ (input_dim, output_dim) = (batch, output_dim)
 
         x_dropped = self.lora_dropout(x)  # (batch, input_dim)
-        # x(AB)T = (xBT)AT
-        lora = (x_dropped @ self.B.T) @ self.A.T  # (batch, output_dim)
+        lora = (x_dropped @ self.A.T) @ self.B.T  # (batch, output_dim)
         lora_scaled = (self.alpha / self.rank) * lora  # (batch, output_dim)
 
         return base + lora_scaled  # (batch, output_dim)
