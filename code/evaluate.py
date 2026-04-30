@@ -79,6 +79,17 @@ def build_model(method: str, args, device: torch.device):
     return model
 
 
+def build_baseline_model(args, device: torch.device):
+    """Build plain backbone + classification head (no adapters loaded)."""
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name,
+        num_labels=1,
+    )
+    model.to(device)
+    model.eval()
+    return model
+
+
 @torch.no_grad()
 def evaluate_model(model, loader, device: torch.device):
     total_loss = 0.0
@@ -145,6 +156,18 @@ def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch
     return metrics
 
 
+def run_baseline(args, loader, device: torch.device):
+    print("[Baseline] Evaluating plain pretrained model (no adapter checkpoint)")
+    model = build_baseline_model(args=args, device=device)
+    metrics = evaluate_model(model, loader, device)
+    print(
+        f"[Baseline] loss={metrics['loss']:.4f} | "
+        f"accuracy={metrics['accuracy']:.4f} | "
+        f"n={metrics['n_examples']}"
+    )
+    return metrics
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -170,6 +193,11 @@ def main():
         collate_fn=lambda batch: collate_fn(batch, tokenizer, args.max_length),
     )
 
+    baseline_metrics = run_baseline(
+        args=args,
+        loader=eval_loader,
+        device=device,
+    )
     dora_metrics = run_one(
         label="DoRA",
         method=args.dora_method,
@@ -188,6 +216,14 @@ def main():
     )
 
     print("\n=== Comparison ===")
+    if baseline_metrics is not None:
+        print(
+            f"Base  | loss={baseline_metrics['loss']:.4f} | "
+            f"acc={baseline_metrics['accuracy']:.4f}"
+        )
+    else:
+        print("Base  | unavailable")
+
     if dora_metrics is not None:
         print(
             f"DoRA  | loss={dora_metrics['loss']:.4f} | "
@@ -209,6 +245,14 @@ def main():
         loss_diff = dora_metrics["loss"] - lora_metrics["loss"]
         # Positive acc delta means DoRA outperformed LoRA on this split.
         print(f"Delta (DoRA - LoRA): acc={acc_diff:+.4f}, loss={loss_diff:+.4f}")
+    if baseline_metrics is not None and dora_metrics is not None:
+        acc_diff = dora_metrics["accuracy"] - baseline_metrics["accuracy"]
+        loss_diff = dora_metrics["loss"] - baseline_metrics["loss"]
+        print(f"Delta (DoRA - Base): acc={acc_diff:+.4f}, loss={loss_diff:+.4f}")
+    if baseline_metrics is not None and lora_metrics is not None:
+        acc_diff = lora_metrics["accuracy"] - baseline_metrics["accuracy"]
+        loss_diff = lora_metrics["loss"] - baseline_metrics["loss"]
+        print(f"Delta (LoRA - Base): acc={acc_diff:+.4f}, loss={loss_diff:+.4f}")
 
 
 if __name__ == "__main__":
