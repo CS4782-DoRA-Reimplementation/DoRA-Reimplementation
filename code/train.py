@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
 
     # data / training
-    parser.add_argument("--dataset", type=str, choices=["boolq", "hellaswag", "piqa"], default="boolq")
+    parser.add_argument("--dataset", type=str, choices=["boolq", "hellaswag", "piqa", "arc_challenge", "arc_easy"], default="boolq")
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=3)
@@ -284,6 +284,32 @@ def load_hellaswag_examples(split: str) -> List[Dict[str, Any]]:
     return examples
 
 
+def load_arc_examples(split: str, config: str = "ARC-Challenge") -> List[Dict[str, Any]]:
+    ds = load_dataset("ai2_arc", config, split=split)
+    examples = []
+
+    for ex in ds:
+        choices = ex["choices"]["text"]
+        labels = ex["choices"]["label"]
+        answer_key = ex["answerKey"]
+
+        if answer_key in labels:
+            label = labels.index(answer_key)
+        else:
+            label = int(answer_key) - 1
+
+        examples.append(
+            {
+                "dataset": config.lower().replace("-", "_"),
+                "prompt": f"Question: {ex['question']}\nAnswer:",
+                "choices": choices,
+                "label": label,
+            }
+        )
+
+    return examples
+
+
 # ============================================================
 # Collation
 # ============================================================
@@ -480,7 +506,8 @@ def main():
 
     trainable, total = count_parameters(model)
     pct = 100.0 * trainable / total
-    print(f"Trainable params: {trainable} / {total} ({pct:.4f}%)")
+    print(f"Method: {args.method.upper()} | Rank: {args.rank}")
+    print(f"Trainable params: {trainable:,} / {total:,} ({pct:.4f}%)")
 
     # --------------------
     # Load datasets
@@ -492,6 +519,10 @@ def main():
         train_dataset = MultiChoiceDataset(load_hellaswag_examples("train"))
     elif args.dataset == "piqa":
         train_dataset = MultiChoiceDataset(load_piqa_examples("train"))
+    elif args.dataset == "arc_challenge":
+        train_dataset = MultiChoiceDataset(load_arc_examples("train", "ARC-Challenge"))
+    elif args.dataset == "arc_easy":
+        train_dataset = MultiChoiceDataset(load_arc_examples("train", "ARC-Easy"))
 
     train_loader = DataLoader(
         train_dataset,
@@ -573,6 +604,18 @@ def main():
 
     total_train_time_sec = time.time() - total_train_start
     print(f"\nTotal training time: {total_train_time_sec:.2f} sec ({total_train_time_sec / 60:.2f} min)")
+
+    final_ckpt = os.path.join(args.save_dir, f"{args.method}_{args.dataset}_final.pt")
+    save_checkpoint(
+        path=final_ckpt,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epoch=args.epochs,
+        step=global_step,
+        args=args,
+    )
+    print(f"Saved final checkpoint to {final_ckpt}")
 
 if __name__ == "__main__":
     main()

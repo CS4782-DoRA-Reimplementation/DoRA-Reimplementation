@@ -14,6 +14,7 @@ from train import (
     load_boolq_examples,
     load_hellaswag_examples,
     load_piqa_examples,
+    load_arc_examples,
     collate_fn,
     grouped_choice_loss,
 )
@@ -25,7 +26,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dataset", type=str, choices=["boolq", "hellaswag", "piqa"], default="boolq")
+    parser.add_argument("--dataset", type=str, choices=["boolq", "hellaswag", "piqa", "arc_challenge", "arc_easy"], default="boolq")
     parser.add_argument(
         "--split",
         type=str,
@@ -115,6 +116,11 @@ def evaluate_model(model, loader, device: torch.device):
 
 
 def resolve_eval_examples(dataset: str, split: str):
+    if dataset == "arc_challenge":
+        return load_arc_examples(split, "ARC-Challenge")
+    if dataset == "arc_easy":
+        return load_arc_examples(split, "ARC-Easy")
+
     loaders = {
         "boolq": load_boolq_examples,
         "hellaswag": load_hellaswag_examples,
