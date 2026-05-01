@@ -18,8 +18,8 @@ from transformers import (
 )
 
 from lora import LoRA
-from dora import DoRA
 from dora2 import DoRAPaper
+from dora3 import DoRA3
 
 import time
 
@@ -39,7 +39,7 @@ def parse_args():
 
     # model / save
     parser.add_argument("--model_name", type=str, default="roberta-base")
-    parser.add_argument("--method", type=str, choices=["lora", "dora", "dora2", "both"], default="dora2")
+    parser.add_argument("--method", type=str, choices=["lora", "dora3", "dora2", "both"], default="dora2")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--seed", type=int, default=100)
