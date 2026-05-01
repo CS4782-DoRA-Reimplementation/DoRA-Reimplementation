@@ -1,7 +1,9 @@
 import os
+import sys
 import math
 import random
 import argparse
+import subprocess
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 
@@ -37,13 +39,13 @@ def parse_args():
 
     # model / save
     parser.add_argument("--model_name", type=str, default="roberta-base")
-    parser.add_argument("--method", type=str, choices=["lora", "dora", "dora2"], default="dora")
+    parser.add_argument("--method", type=str, choices=["lora", "dora", "dora2", "both"], default="dora2")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=100)
 
     # data / training
-    parser.add_argument("--dataset", type=str, choices=["boolq", "hellaswag", "piqa", "arc_challenge", "arc_easy"], default="boolq")
+    parser.add_argument("--dataset", type=str, choices=["boolq", "piqa", "siqa", "hellaswag", "arc_challenge", "arc_easy", "winogrande", "openbookqa", "all"], default="boolq")
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=3)
@@ -250,8 +252,9 @@ def load_boolq_examples(split: str) -> List[Dict[str, Any]]:
     return examples
 
 
+
 def load_piqa_examples(split: str) -> List[Dict[str, Any]]:
-    ds = load_dataset("piqa", split=split)
+    ds = load_dataset("piqa", split=split, trust_remote_code=True)
     examples = []
 
     for ex in ds:
@@ -267,8 +270,25 @@ def load_piqa_examples(split: str) -> List[Dict[str, Any]]:
     return examples
 
 
+def load_siqa_examples(split: str) -> List[Dict[str, Any]]:
+    ds = load_dataset("social_i_qa", split=split, trust_remote_code=True)
+    examples = []
+
+    for ex in ds:
+        examples.append(
+            {
+                "dataset": "siqa",
+                "prompt": f"Context: {ex['context']}\nQuestion: {ex['question']}\nAnswer:",
+                "choices": [ex["answerA"], ex["answerB"], ex["answerC"]],
+                "label": int(ex["label"]) - 1,
+            }
+        )
+
+    return examples
+
+
 def load_hellaswag_examples(split: str) -> List[Dict[str, Any]]:
-    ds = load_dataset("hellaswag", split=split)
+    ds = load_dataset("hellaswag", split=split, trust_remote_code=True)
     examples = []
 
     for ex in ds:
@@ -281,6 +301,22 @@ def load_hellaswag_examples(split: str) -> List[Dict[str, Any]]:
             }
         )
 
+    return examples
+
+
+def load_all_examples(split: str) -> List[Dict[str, Any]]:
+    print("Loading all 8 commonsense datasets...")
+    _val = "validation"
+    examples = []
+    examples += load_boolq_examples(split)
+    examples += load_piqa_examples(split if split != "test" else _val)
+    examples += load_siqa_examples(split if split != "test" else _val)
+    examples += load_hellaswag_examples(split if split != "test" else _val)
+    examples += load_winogrande_examples(split if split != "test" else _val)
+    examples += load_arc_examples(split, "ARC-Challenge")
+    examples += load_arc_examples(split, "ARC-Easy")
+    examples += load_openbookqa_examples(split)
+    print(f"Total combined examples: {len(examples)}")
     return examples
 
 
@@ -302,6 +338,49 @@ def load_arc_examples(split: str, config: str = "ARC-Challenge") -> List[Dict[st
             {
                 "dataset": config.lower().replace("-", "_"),
                 "prompt": f"Question: {ex['question']}\nAnswer:",
+                "choices": choices,
+                "label": label,
+            }
+        )
+
+    return examples
+
+
+def load_winogrande_examples(split: str) -> List[Dict[str, Any]]:
+    ds = load_dataset("winogrande", "winogrande_xl", split=split)
+    examples = []
+
+    for ex in ds:
+        examples.append(
+            {
+                "dataset": "winogrande",
+                "prompt": ex["sentence"],
+                "choices": [ex["option1"], ex["option2"]],
+                "label": int(ex["answer"]) - 1,
+            }
+        )
+
+    return examples
+
+
+def load_openbookqa_examples(split: str) -> List[Dict[str, Any]]:
+    ds = load_dataset("openbookqa", "main", split=split)
+    examples = []
+
+    for ex in ds:
+        choices = ex["choices"]["text"]
+        labels = ex["choices"]["label"]
+        answer_key = ex["answerKey"]
+
+        if answer_key in labels:
+            label = labels.index(answer_key)
+        else:
+            label = int(answer_key) - 1
+
+        examples.append(
+            {
+                "dataset": "openbookqa",
+                "prompt": f"Question: {ex['question_stem']}\nAnswer:",
                 "choices": choices,
                 "label": label,
             }
@@ -469,6 +548,16 @@ def train_one_epoch(
 
 def main():
     args = parse_args()
+
+    if args.method == "both":
+        for method in ["lora", "dora2"]:
+            cmd = [sys.executable] + sys.argv[:]
+            idx = cmd.index("--method")
+            cmd[idx + 1] = method
+            print(f"\n{'='*60}\nStarting {method.upper()} training\n{'='*60}")
+            subprocess.run(cmd, check=True)
+        return
+
     set_seed(args.seed)
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -515,14 +604,22 @@ def main():
     print(f"Loading {args.dataset}...")
     if args.dataset == "boolq":
         train_dataset = MultiChoiceDataset(load_boolq_examples("train"))
-    elif args.dataset == "hellaswag":
-        train_dataset = MultiChoiceDataset(load_hellaswag_examples("train"))
     elif args.dataset == "piqa":
         train_dataset = MultiChoiceDataset(load_piqa_examples("train"))
+    elif args.dataset == "siqa":
+        train_dataset = MultiChoiceDataset(load_siqa_examples("train"))
+    elif args.dataset == "hellaswag":
+        train_dataset = MultiChoiceDataset(load_hellaswag_examples("train"))
     elif args.dataset == "arc_challenge":
         train_dataset = MultiChoiceDataset(load_arc_examples("train", "ARC-Challenge"))
     elif args.dataset == "arc_easy":
         train_dataset = MultiChoiceDataset(load_arc_examples("train", "ARC-Easy"))
+    elif args.dataset == "winogrande":
+        train_dataset = MultiChoiceDataset(load_winogrande_examples("train"))
+    elif args.dataset == "openbookqa":
+        train_dataset = MultiChoiceDataset(load_openbookqa_examples("train"))
+    elif args.dataset == "all":
+        train_dataset = MultiChoiceDataset(load_all_examples("train"))
 
     train_loader = DataLoader(
         train_dataset,

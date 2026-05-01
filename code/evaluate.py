@@ -12,9 +12,12 @@ from train import (
     freeze_non_adapter_params,
     MultiChoiceDataset,
     load_boolq_examples,
-    load_hellaswag_examples,
     load_piqa_examples,
+    load_siqa_examples,
+    load_hellaswag_examples,
     load_arc_examples,
+    load_winogrande_examples,
+    load_openbookqa_examples,
     collate_fn,
     grouped_choice_loss,
 )
@@ -26,7 +29,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dataset", type=str, choices=["boolq", "hellaswag", "piqa", "arc_challenge", "arc_easy"], default="boolq")
+    parser.add_argument("--dataset", type=str, choices=["boolq", "piqa", "siqa", "hellaswag", "arc_challenge", "arc_easy", "winogrande", "openbookqa"], default="boolq")
     parser.add_argument(
         "--split",
         type=str,
@@ -120,11 +123,17 @@ def resolve_eval_examples(dataset: str, split: str):
         return load_arc_examples(split, "ARC-Challenge")
     if dataset == "arc_easy":
         return load_arc_examples(split, "ARC-Easy")
+    if dataset == "piqa":
+        return load_piqa_examples(split if split != "test" else "validation")
+    if dataset == "siqa":
+        return load_siqa_examples(split if split != "test" else "validation")
+    if dataset == "winogrande":
+        return load_winogrande_examples(split if split != "test" else "validation")
 
     loaders = {
         "boolq": load_boolq_examples,
         "hellaswag": load_hellaswag_examples,
-        "piqa": load_piqa_examples,
+        "openbookqa": load_openbookqa_examples,
     }
     load_fn = loaders[dataset]
     try:
