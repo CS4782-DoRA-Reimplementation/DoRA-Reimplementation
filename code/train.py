@@ -14,6 +14,7 @@ from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
     get_linear_schedule_with_warmup,
 )
 
@@ -28,6 +29,13 @@ import time
 # Utils
 # ============================================================
 
+_CAUSAL_PREFIXES = ("llama", "mistral", "opt", "gpt2", "gpt-", "phi", "falcon", "gemma")
+
+def detect_model_type(model_name: str) -> str:
+    name = model_name.lower()
+    return "causal" if any(p in name for p in _CAUSAL_PREFIXES) else "encoder"
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -39,6 +47,7 @@ def parse_args():
 
     # model / save
     parser.add_argument("--model_name", type=str, default="roberta-base")
+    parser.add_argument("--model_type", type=str, choices=["encoder", "causal", "auto"], default="auto")
     parser.add_argument("--method", type=str, choices=["lora", "dora3", "dora2", "both"], default="dora2")
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
@@ -435,6 +444,56 @@ def collate_fn(examples: List[Dict[str, Any]], tokenizer, max_length: int) -> Ba
     )
 
 
+@dataclass
+class CausalBatch:
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    label_ids: torch.Tensor
+    labels: torch.Tensor
+    num_choices: List[int]
+
+
+def collate_fn_causal(examples: List[Dict[str, Any]], tokenizer, max_length: int) -> CausalBatch:
+    all_input_ids = []
+    all_label_ids = []
+    labels = []
+    num_choices = []
+
+    for ex in examples:
+        prompt = ex["prompt"]
+        choices = ex["choices"]
+        labels.append(ex["label"])
+        num_choices.append(len(choices))
+
+        prompt_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
+        prompt_len = len(prompt_ids)
+
+        for choice in choices:
+            choice_ids = tokenizer(" " + choice, add_special_tokens=False)["input_ids"]
+            full_ids = (prompt_ids + choice_ids)[:max_length]
+            lbl_ids = ([-100] * prompt_len + choice_ids)[:max_length]
+            all_input_ids.append(torch.tensor(full_ids, dtype=torch.long))
+            all_label_ids.append(torch.tensor(lbl_ids, dtype=torch.long))
+
+    max_len = max(ids.shape[0] for ids in all_input_ids)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    padded_input, padded_mask, padded_lbl = [], [], []
+    for inp, lbl in zip(all_input_ids, all_label_ids):
+        pad_len = max_len - inp.shape[0]
+        padded_input.append(torch.cat([inp, torch.full((pad_len,), pad_id)]))
+        padded_mask.append(torch.cat([torch.ones(inp.shape[0], dtype=torch.long), torch.zeros(pad_len, dtype=torch.long)]))
+        padded_lbl.append(torch.cat([lbl, torch.full((pad_len,), -100, dtype=torch.long)]))
+
+    return CausalBatch(
+        input_ids=torch.stack(padded_input),
+        attention_mask=torch.stack(padded_mask),
+        label_ids=torch.stack(padded_lbl),
+        labels=torch.tensor(labels, dtype=torch.long),
+        num_choices=num_choices,
+    )
+
+
 # ============================================================
 # Loss over variable number of choices
 # ============================================================
@@ -476,6 +535,46 @@ def grouped_choice_loss(
     return loss, choice_logits
 
 
+def causal_choice_loss(
+    logits: torch.Tensor,
+    label_ids: torch.Tensor,
+    labels: torch.Tensor,
+    num_choices: List[int],
+):
+    """
+    logits:    (total_choices, seq_len, vocab_size)
+    label_ids: (total_choices, seq_len) — -100 for prompt tokens
+    labels:    (batch,)
+    """
+    shift_logits = logits[:, :-1, :].float()
+    shift_labels = label_ids[:, 1:]
+
+    mask = shift_labels != -100
+    gather_labels = shift_labels.clone()
+    gather_labels[~mask] = 0
+
+    log_probs = torch.log_softmax(shift_logits, dim=-1)
+    token_log_probs = log_probs.gather(2, gather_labels.unsqueeze(2)).squeeze(2)
+    choice_scores = (token_log_probs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+
+    grouped, idx = [], 0
+    for n in num_choices:
+        grouped.append(choice_scores[idx: idx + n])
+        idx += n
+
+    max_choices = max(num_choices)
+    padded = []
+    for g in grouped:
+        if g.numel() < max_choices:
+            pad = torch.full((max_choices - g.numel(),), -1e9, device=g.device, dtype=g.dtype)
+            g = torch.cat([g, pad])
+        padded.append(g)
+
+    choice_logits = torch.stack(padded)
+    loss = nn.CrossEntropyLoss()(choice_logits, labels)
+    return loss, choice_logits
+
+
 # ============================================================
 # Training
 # ============================================================
@@ -508,6 +607,7 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     args,
+    model_type: str = "encoder",
 ):
     model.train()
     running_loss = 0.0
@@ -518,12 +618,13 @@ def train_one_epoch(
         attention_mask = batch.attention_mask.to(device)
         labels = batch.labels.to(device)
 
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-        loss, _ = grouped_choice_loss(outputs.logits, labels, batch.num_choices)
+        if model_type == "causal":
+            label_ids = batch.label_ids.to(device)
+            loss, _ = causal_choice_loss(outputs.logits, label_ids, labels, batch.num_choices)
+        else:
+            loss, _ = grouped_choice_loss(outputs.logits, labels, batch.num_choices)
 
         optimizer.zero_grad()
         loss.backward()
@@ -569,17 +670,23 @@ def main():
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model_type = args.model_type if args.model_type != "auto" else detect_model_type(args.model_name)
+    print(f"Model type: {model_type}")
 
-    # RoBERTa already has a pad token, but this check keeps the code safer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # num_labels=1 because we score each (prompt, choice) pair with one scalar logit
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
-        num_labels=1,
-    )
+    if model_type == "causal":
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=torch.float16,
+        )
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name,
+            num_labels=1,
+        )
 
     replace_linear_layers_with_adapters(
         module=model,
@@ -621,11 +728,16 @@ def main():
     elif args.dataset == "all":
         train_dataset = MultiChoiceDataset(load_all_examples("train"))
 
+    if model_type == "causal":
+        _collate = lambda batch: collate_fn_causal(batch, tokenizer, args.max_length)
+    else:
+        _collate = lambda batch: collate_fn(batch, tokenizer, args.max_length)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer, args.max_length),
+        collate_fn=_collate,
     )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -673,6 +785,7 @@ def main():
             device=device,
             epoch=epoch,
             args=args,
+            model_type=model_type,
         )
 
         epoch_time_sec = time.time() - epoch_start_time

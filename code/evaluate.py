@@ -8,6 +8,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from train import (
     set_seed,
+    detect_model_type,
     replace_linear_layers_with_adapters,
     freeze_non_adapter_params,
     MultiChoiceDataset,
@@ -19,13 +20,16 @@ from train import (
     load_winogrande_examples,
     load_openbookqa_examples,
     collate_fn,
+    collate_fn_causal,
     grouped_choice_loss,
+    causal_choice_loss,
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="roberta-base")
+    parser.add_argument("--model_type", type=str, choices=["encoder", "causal", "auto"], default="auto")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
@@ -64,11 +68,12 @@ def _extract_state_dict(ckpt_obj: Dict[str, Any]) -> Dict[str, Any]:
     return ckpt_obj
 
 
-def build_model(method: str, args, device: torch.device):
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
-        num_labels=1,
-    )
+def build_model(method: str, args, device: torch.device, model_type: str = "encoder"):
+    if model_type == "causal":
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=1)
     replace_linear_layers_with_adapters(
         module=model,
         method=method,
@@ -83,19 +88,19 @@ def build_model(method: str, args, device: torch.device):
     return model
 
 
-def build_baseline_model(args, device: torch.device):
-    """Build plain backbone + classification head (no adapters loaded)."""
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name,
-        num_labels=1,
-    )
+def build_baseline_model(args, device: torch.device, model_type: str = "encoder"):
+    if model_type == "causal":
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=1)
     model.to(device)
     model.eval()
     return model
 
 
 @torch.no_grad()
-def evaluate_model(model, loader, device: torch.device):
+def evaluate_model(model, loader, device: torch.device, model_type: str = "encoder"):
     total_loss = 0.0
     total_correct = 0
     total_examples = 0
@@ -106,7 +111,12 @@ def evaluate_model(model, loader, device: torch.device):
         labels = batch.labels.to(device)
 
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        loss, choice_logits = grouped_choice_loss(outputs.logits, labels, batch.num_choices)
+
+        if model_type == "causal":
+            label_ids = batch.label_ids.to(device)
+            loss, choice_logits = causal_choice_loss(outputs.logits, label_ids, labels, batch.num_choices)
+        else:
+            loss, choice_logits = grouped_choice_loss(outputs.logits, labels, batch.num_choices)
 
         preds = torch.argmax(choice_logits, dim=1)
         total_correct += (preds == labels).sum().item()
@@ -145,24 +155,23 @@ def resolve_eval_examples(dataset: str, split: str):
         raise
 
 
-def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch.device):
+def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch.device, model_type: str = "encoder"):
     if not os.path.exists(ckpt_path):
         print(f"[{label}] Missing checkpoint: {ckpt_path}")
         return None
 
     print(f"[{label}] Loading checkpoint: {ckpt_path}")
-    model = build_model(method=method, args=args, device=device)
+    model = build_model(method=method, args=args, device=device, model_type=model_type)
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
     state_dict = _extract_state_dict(ckpt)
-    # strict=False keeps evaluation robust to minor naming differences.
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"[{label}] Missing keys while loading: {len(missing)}")
     if unexpected:
         print(f"[{label}] Unexpected keys while loading: {len(unexpected)}")
 
-    metrics = evaluate_model(model, loader, device)
+    metrics = evaluate_model(model, loader, device, model_type=model_type)
     print(
         f"[{label}] loss={metrics['loss']:.4f} | "
         f"accuracy={metrics['accuracy']:.4f} | "
@@ -171,10 +180,10 @@ def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch
     return metrics
 
 
-def run_baseline(args, loader, device: torch.device):
+def run_baseline(args, loader, device: torch.device, model_type: str = "encoder"):
     print("[Baseline] Evaluating plain pretrained model (no adapter checkpoint)")
-    model = build_baseline_model(args=args, device=device)
-    metrics = evaluate_model(model, loader, device)
+    model = build_baseline_model(args=args, device=device, model_type=model_type)
+    metrics = evaluate_model(model, loader, device, model_type=model_type)
     print(
         f"[Baseline] loss={metrics['loss']:.4f} | "
         f"accuracy={metrics['accuracy']:.4f} | "
@@ -195,24 +204,29 @@ def main():
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
+    model_type = args.model_type if args.model_type != "auto" else detect_model_type(args.model_name)
+    print(f"Model type: {model_type}")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     eval_examples = resolve_eval_examples(args.dataset, args.split)
     eval_dataset = MultiChoiceDataset(eval_examples)
+
+    if model_type == "causal":
+        _collate = lambda batch: collate_fn_causal(batch, tokenizer, args.max_length)
+    else:
+        _collate = lambda batch: collate_fn(batch, tokenizer, args.max_length)
+
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer, args.max_length),
+        collate_fn=_collate,
     )
 
-    baseline_metrics = run_baseline(
-        args=args,
-        loader=eval_loader,
-        device=device,
-    )
+    baseline_metrics = run_baseline(args=args, loader=eval_loader, device=device, model_type=model_type)
     dora_metrics = run_one(
         label="DoRA",
         method=args.dora_method,
@@ -220,6 +234,7 @@ def main():
         args=args,
         loader=eval_loader,
         device=device,
+        model_type=model_type,
     )
     lora_metrics = run_one(
         label="LoRA",
@@ -228,6 +243,7 @@ def main():
         args=args,
         loader=eval_loader,
         device=device,
+        model_type=model_type,
     )
 
     print("\n=== Comparison ===")
