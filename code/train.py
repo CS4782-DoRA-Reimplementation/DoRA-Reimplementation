@@ -625,6 +625,8 @@ def save_checkpoint(
     step: int,
     args,
 ):
+    import random as _random
+    import numpy as _np
     ckpt = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -632,6 +634,12 @@ def save_checkpoint(
         "epoch": epoch,
         "step": step,
         "args": vars(args),
+        "rng_state": {
+            "torch": torch.random.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy": _np.random.get_state(),
+            "python": _random.getstate(),
+        },
     }
     torch.save(ckpt, path)
 
@@ -896,6 +904,22 @@ def main():
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt["step"]
+        # Move optimizer states to the correct device
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        # Restore RNG state so batch ordering matches the original run
+        if "rng_state" in ckpt:
+            import random as _random
+            import numpy as _np
+            rng = ckpt["rng_state"]
+            torch.random.set_rng_state(rng["torch"])
+            if rng.get("torch_cuda") is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(rng["torch_cuda"])
+            _np.random.set_state(rng["numpy"])
+            _random.setstate(rng["python"])
+            print("Restored RNG state from checkpoint.")
         print(f"Resumed from checkpoint: {args.resume_from_checkpoint}")
 
     # --------------------

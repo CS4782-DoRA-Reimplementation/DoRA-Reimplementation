@@ -41,10 +41,12 @@ def parse_args():
         help="Dataset split to evaluate (validation or test). Falls back to validation if test is unavailable.",
     )
 
-    parser.add_argument("--dora_method", type=str, choices=["dora", "dora2"], default="dora2",
-                        help="Which DoRA implementation to use (dora=dora.py, dora2=dora2.py)")
-    parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--alpha", type=float, default=16.0)
+    parser.add_argument("--dora_method", type=str, choices=["dora", "dora2", "dora3"], default="dora3",
+                        help="Which DoRA implementation to use")
+    parser.add_argument("--rank", type=int, default=16)
+    parser.add_argument("--alpha", type=float, default=32.0)
+    parser.add_argument("--load_in_4bit", action="store_true")
+    parser.add_argument("--eval_all", action="store_true", help="Evaluate DoRA3 checkpoint across all datasets and print a table")
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--target_modules", nargs="*", default=None)
 
@@ -68,10 +70,27 @@ def _extract_state_dict(ckpt_obj: Dict[str, Any]) -> Dict[str, Any]:
     return ckpt_obj
 
 
-def build_model(method: str, args, device: torch.device, model_type: str = "encoder"):
+def _load_causal_model(args, tokenizer):
+    from transformers import AutoModelForCausalLM, AutoConfig
+    model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+    if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
+        model_config.pad_token_id = tokenizer.eos_token_id
+    if args.load_in_4bit:
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+        return AutoModelForCausalLM.from_pretrained(
+            args.model_name, config=model_config,
+            quantization_config=bnb_config, device_map="auto", trust_remote_code=True,
+        )
+    return AutoModelForCausalLM.from_pretrained(
+        args.model_name, config=model_config,
+        torch_dtype=torch.float16, trust_remote_code=True,
+    )
+
+
+def build_model(method: str, args, device: torch.device, model_type: str = "encoder", tokenizer=None):
     if model_type == "causal":
-        from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
+        model = _load_causal_model(args, tokenizer)
     else:
         model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=1)
     replace_linear_layers_with_adapters(
@@ -83,18 +102,19 @@ def build_model(method: str, args, device: torch.device, model_type: str = "enco
         target_modules=args.target_modules,
     )
     freeze_non_adapter_params(model)
-    model.to(device)
+    if not args.load_in_4bit:
+        model.to(device)
     model.eval()
     return model
 
 
-def build_baseline_model(args, device: torch.device, model_type: str = "encoder"):
+def build_baseline_model(args, device: torch.device, model_type: str = "encoder", tokenizer=None):
     if model_type == "causal":
-        from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
+        model = _load_causal_model(args, tokenizer)
     else:
         model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=1)
-    model.to(device)
+    if not args.load_in_4bit:
+        model.to(device)
     model.eval()
     return model
 
@@ -155,13 +175,13 @@ def resolve_eval_examples(dataset: str, split: str):
         raise
 
 
-def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch.device, model_type: str = "encoder"):
+def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch.device, model_type: str = "encoder", tokenizer=None):
     if not os.path.exists(ckpt_path):
         print(f"[{label}] Missing checkpoint: {ckpt_path}")
         return None
 
     print(f"[{label}] Loading checkpoint: {ckpt_path}")
-    model = build_model(method=method, args=args, device=device, model_type=model_type)
+    model = build_model(method=method, args=args, device=device, model_type=model_type, tokenizer=tokenizer)
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
     state_dict = _extract_state_dict(ckpt)
@@ -180,9 +200,9 @@ def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch
     return metrics
 
 
-def run_baseline(args, loader, device: torch.device, model_type: str = "encoder"):
+def run_baseline(args, loader, device: torch.device, model_type: str = "encoder", tokenizer=None):
     print("[Baseline] Evaluating plain pretrained model (no adapter checkpoint)")
-    model = build_baseline_model(args=args, device=device, model_type=model_type)
+    model = build_baseline_model(args=args, device=device, model_type=model_type, tokenizer=tokenizer)
     metrics = evaluate_model(model, loader, device, model_type=model_type)
     print(
         f"[Baseline] loss={metrics['loss']:.4f} | "
@@ -190,6 +210,53 @@ def run_baseline(args, loader, device: torch.device, model_type: str = "encoder"
         f"n={metrics['n_examples']}"
     )
     return metrics
+
+
+ALL_DATASETS = ["boolq", "piqa", "siqa", "hellaswag", "winogrande", "arc_challenge", "arc_easy", "openbookqa"]
+
+def evaluate_all_datasets(args, device, model_type, tokenizer):
+    print(f"\nLoading DoRA3 model from {args.dora_checkpoint}...")
+    model = build_model(method=args.dora_method, args=args, device=device, model_type=model_type, tokenizer=tokenizer)
+    ckpt = torch.load(args.dora_checkpoint, map_location="cpu")
+    state_dict = _extract_state_dict(ckpt)
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+
+    results = {}
+    for dataset in ALL_DATASETS:
+        print(f"Evaluating {dataset}...", end=" ", flush=True)
+        try:
+            examples = resolve_eval_examples(dataset, "validation")
+            loader = DataLoader(
+                MultiChoiceDataset(examples),
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=lambda batch: collate_fn_causal(batch, tokenizer, args.max_length)
+                    if model_type == "causal" else collate_fn(batch, tokenizer, args.max_length),
+            )
+            metrics = evaluate_model(model, loader, device, model_type=model_type)
+            results[dataset] = metrics
+            print(f"acc={metrics['accuracy']:.4f}")
+        except Exception as e:
+            print(f"FAILED ({e})")
+            results[dataset] = None
+
+    print("\n" + "=" * 55)
+    print(f"{'Dataset':<18} {'Accuracy':>10} {'Loss':>10} {'N':>8}")
+    print("-" * 55)
+    accs = []
+    for dataset in ALL_DATASETS:
+        m = results[dataset]
+        if m:
+            print(f"{dataset:<18} {m['accuracy']:>10.4f} {m['loss']:>10.4f} {m['n_examples']:>8}")
+            accs.append(m['accuracy'])
+        else:
+            print(f"{dataset:<18} {'N/A':>10} {'N/A':>10} {'N/A':>8}")
+    print("-" * 55)
+    if accs:
+        print(f"{'Average':<18} {sum(accs)/len(accs):>10.4f}")
+    print("=" * 55)
+    return results
 
 
 def main():
@@ -207,9 +274,13 @@ def main():
     model_type = args.model_type if args.model_type != "auto" else detect_model_type(args.model_name)
     print(f"Model type: {model_type}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    if args.eval_all:
+        evaluate_all_datasets(args, device, model_type, tokenizer)
+        return
 
     eval_examples = resolve_eval_examples(args.dataset, args.split)
     eval_dataset = MultiChoiceDataset(eval_examples)
@@ -226,7 +297,7 @@ def main():
         collate_fn=_collate,
     )
 
-    baseline_metrics = run_baseline(args=args, loader=eval_loader, device=device, model_type=model_type)
+    baseline_metrics = run_baseline(args=args, loader=eval_loader, device=device, model_type=model_type, tokenizer=tokenizer)
     dora_metrics = run_one(
         label="DoRA",
         method=args.dora_method,
@@ -235,6 +306,7 @@ def main():
         loader=eval_loader,
         device=device,
         model_type=model_type,
+        tokenizer=tokenizer,
     )
     lora_metrics = run_one(
         label="LoRA",
@@ -244,6 +316,7 @@ def main():
         loader=eval_loader,
         device=device,
         model_type=model_type,
+        tokenizer=tokenizer,
     )
 
     print("\n=== Comparison ===")
