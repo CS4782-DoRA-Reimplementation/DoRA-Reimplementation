@@ -54,7 +54,16 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=100)
 
     # data / training
-    parser.add_argument("--dataset", type=str, choices=["boolq", "piqa", "siqa", "hellaswag", "arc_challenge", "arc_easy", "winogrande", "openbookqa", "all"], default="boolq")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["boolq", "piqa", "siqa", "hellaswag", "arc_challenge", "arc_easy", "winogrande", "openbookqa", "all", "some"],
+        default="boolq",
+        help=(
+            "Dataset to train on. 'all' loads every benchmark; 'some' is the same union but drops "
+            "HellaSwag and WinoGrande (the two largest train splits) for lighter runs."
+        ),
+    )
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=10)
@@ -359,6 +368,24 @@ def load_all_examples(split: str) -> List[Dict[str, Any]]:
     examples += load_siqa_examples(split if split != "test" else _val)
     examples += load_hellaswag_examples(split if split != "test" else _val)
     examples += load_winogrande_examples(split if split != "test" else _val)
+    examples += load_arc_examples(split, "ARC-Challenge")
+    examples += load_arc_examples(split, "ARC-Easy")
+    examples += load_openbookqa_examples(split)
+    print(f"Total combined examples: {len(examples)}")
+    return examples
+
+
+def load_some_examples(split: str) -> List[Dict[str, Any]]:
+    """
+    Same sources as load_all_examples, but omits HellaSwag and WinoGrande (the two largest
+    train splits in this mix) for faster / smaller combined training.
+    """
+    _val = "validation"
+    print("Loading combined datasets (all except HellaSwag & WinoGrande)...")
+    examples = []
+    examples += load_boolq_examples(split)
+    examples += load_piqa_examples(split if split != "test" else _val)
+    examples += load_siqa_examples(split if split != "test" else _val)
     examples += load_arc_examples(split, "ARC-Challenge")
     examples += load_arc_examples(split, "ARC-Easy")
     examples += load_openbookqa_examples(split)
@@ -734,6 +761,8 @@ def load_val_examples_for_dataset(dataset_name: str) -> List[Dict[str, Any]]:
         return load_openbookqa_examples(_val)
     elif dataset_name == "all":
         return load_all_examples(_val)
+    elif dataset_name == "some":
+        return load_some_examples(_val)
     return []
 
 
@@ -847,6 +876,8 @@ def main():
         train_dataset = MultiChoiceDataset(load_openbookqa_examples("train"))
     elif args.dataset == "all":
         train_dataset = MultiChoiceDataset(load_all_examples("train"))
+    elif args.dataset == "some":
+        train_dataset = MultiChoiceDataset(load_some_examples("train"))
 
     if model_type == "causal":
         _collate = lambda batch: collate_fn_causal(batch, tokenizer, args.max_length)

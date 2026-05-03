@@ -19,6 +19,7 @@ from train import (
     load_arc_examples,
     load_winogrande_examples,
     load_openbookqa_examples,
+    load_some_examples,
     collate_fn,
     collate_fn_causal,
     grouped_choice_loss,
@@ -33,7 +34,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dataset", type=str, choices=["boolq", "piqa", "siqa", "hellaswag", "arc_challenge", "arc_easy", "winogrande", "openbookqa"], default="boolq")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["boolq", "piqa", "siqa", "hellaswag", "arc_challenge", "arc_easy", "winogrande", "openbookqa", "some"],
+        default="boolq",
+    )
     parser.add_argument(
         "--split",
         type=str,
@@ -194,6 +200,8 @@ def evaluate_model(model, loader, device: torch.device, model_type: str = "encod
 
 
 def resolve_eval_examples(dataset: str, split: str):
+    if dataset == "some":
+        return load_some_examples(split if split != "test" else "validation")
     if dataset == "arc_challenge":
         return load_arc_examples(split, "ARC-Challenge")
     if dataset == "arc_easy":
