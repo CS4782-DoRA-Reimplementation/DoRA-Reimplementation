@@ -41,8 +41,13 @@ def parse_args():
         help="Dataset split to evaluate (validation or test). Falls back to validation if test is unavailable.",
     )
 
-    parser.add_argument("--dora_method", type=str, choices=["dora", "dora2"], default="dora2",
-                        help="Which DoRA implementation to use (dora=dora.py, dora2=dora2.py)")
+    parser.add_argument(
+        "--dora_method",
+        type=str,
+        choices=["dora2", "dora3"],
+        default="dora2",
+        help="DoRA adapter in checkpoints: dora2=DoRAPaper (dora2.py), dora3=DoRA3 (dora3.py); must match training.",
+    )
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--alpha", type=float, default=16.0)
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -58,6 +63,16 @@ def parse_args():
         type=str,
         default="./checkpoints/lora_final_roberta.pt",
     )
+    parser.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        help="Load causal LM in 4-bit (bitsandbytes); must match training for checkpoint compatibility.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing on causal models (saves VRAM during forward).",
+    )
     return parser.parse_args()
 
 
@@ -68,10 +83,57 @@ def _extract_state_dict(ckpt_obj: Dict[str, Any]) -> Dict[str, Any]:
     return ckpt_obj
 
 
-def build_model(method: str, args, device: torch.device, model_type: str = "encoder"):
+def _batch_device(model: torch.nn.Module) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def _load_causal_lm_base(args, tokenizer):
+    """Match train.py causal loading (4-bit vs fp16, trust_remote_code)."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+    if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
+        model_config.pad_token_id = tokenizer.eos_token_id
+
+    if args.load_in_4bit:
+        from transformers import BitsAndBytesConfig
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            config=model_config,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            config=model_config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+        )
+    if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    return model
+
+
+def build_model(
+    method: str,
+    args,
+    device: torch.device,
+    model_type: str = "encoder",
+    tokenizer=None,
+):
     if model_type == "causal":
-        from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
+        tok = tokenizer or AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+        model = _load_causal_lm_base(args, tok)
     else:
         model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=1)
     replace_linear_layers_with_adapters(
@@ -83,18 +145,20 @@ def build_model(method: str, args, device: torch.device, model_type: str = "enco
         target_modules=args.target_modules,
     )
     freeze_non_adapter_params(model)
-    model.to(device)
+    if not (model_type == "causal" and args.load_in_4bit):
+        model.to(device)
     model.eval()
     return model
 
 
-def build_baseline_model(args, device: torch.device, model_type: str = "encoder"):
+def build_baseline_model(args, device: torch.device, model_type: str = "encoder", tokenizer=None):
     if model_type == "causal":
-        from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
+        tok = tokenizer or AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+        model = _load_causal_lm_base(args, tok)
     else:
         model = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=1)
-    model.to(device)
+    if not (model_type == "causal" and args.load_in_4bit):
+        model.to(device)
     model.eval()
     return model
 
@@ -104,16 +168,17 @@ def evaluate_model(model, loader, device: torch.device, model_type: str = "encod
     total_loss = 0.0
     total_correct = 0
     total_examples = 0
+    batch_dev = _batch_device(model) if model_type == "causal" else device
 
     for batch in loader:
-        input_ids = batch.input_ids.to(device)
-        attention_mask = batch.attention_mask.to(device)
-        labels = batch.labels.to(device)
+        input_ids = batch.input_ids.to(batch_dev)
+        attention_mask = batch.attention_mask.to(batch_dev)
+        labels = batch.labels.to(batch_dev)
 
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
         if model_type == "causal":
-            label_ids = batch.label_ids.to(device)
+            label_ids = batch.label_ids.to(batch_dev)
             loss, choice_logits = causal_choice_loss(outputs.logits, label_ids, labels, batch.num_choices)
         else:
             loss, choice_logits = grouped_choice_loss(outputs.logits, labels, batch.num_choices)
@@ -155,13 +220,28 @@ def resolve_eval_examples(dataset: str, split: str):
         raise
 
 
-def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch.device, model_type: str = "encoder"):
+def run_one(
+    label: str,
+    method: str,
+    ckpt_path: str,
+    args,
+    loader,
+    device: torch.device,
+    model_type: str = "encoder",
+    tokenizer=None,
+):
     if not os.path.exists(ckpt_path):
         print(f"[{label}] Missing checkpoint: {ckpt_path}")
         return None
 
     print(f"[{label}] Loading checkpoint: {ckpt_path}")
-    model = build_model(method=method, args=args, device=device, model_type=model_type)
+    model = build_model(
+        method=method,
+        args=args,
+        device=device,
+        model_type=model_type,
+        tokenizer=tokenizer,
+    )
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
     state_dict = _extract_state_dict(ckpt)
@@ -180,9 +260,11 @@ def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch
     return metrics
 
 
-def run_baseline(args, loader, device: torch.device, model_type: str = "encoder"):
+def run_baseline(args, loader, device: torch.device, model_type: str = "encoder", tokenizer=None):
     print("[Baseline] Evaluating plain pretrained model (no adapter checkpoint)")
-    model = build_baseline_model(args=args, device=device, model_type=model_type)
+    model = build_baseline_model(
+        args=args, device=device, model_type=model_type, tokenizer=tokenizer
+    )
     metrics = evaluate_model(model, loader, device, model_type=model_type)
     print(
         f"[Baseline] loss={metrics['loss']:.4f} | "
@@ -207,7 +289,10 @@ def main():
     model_type = args.model_type if args.model_type != "auto" else detect_model_type(args.model_name)
     print(f"Model type: {model_type}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if args.load_in_4bit and not torch.cuda.is_available():
+        print("Warning: --load_in_4bit requires CUDA + bitsandbytes; this run may fail.")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -226,7 +311,13 @@ def main():
         collate_fn=_collate,
     )
 
-    baseline_metrics = run_baseline(args=args, loader=eval_loader, device=device, model_type=model_type)
+    baseline_metrics = run_baseline(
+        args=args,
+        loader=eval_loader,
+        device=device,
+        model_type=model_type,
+        tokenizer=tokenizer,
+    )
     dora_metrics = run_one(
         label="DoRA",
         method=args.dora_method,
@@ -235,6 +326,7 @@ def main():
         loader=eval_loader,
         device=device,
         model_type=model_type,
+        tokenizer=tokenizer,
     )
     lora_metrics = run_one(
         label="LoRA",
@@ -244,6 +336,7 @@ def main():
         loader=eval_loader,
         device=device,
         model_type=model_type,
+        tokenizer=tokenizer,
     )
 
     print("\n=== Comparison ===")
