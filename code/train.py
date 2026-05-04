@@ -270,12 +270,6 @@ class MultiChoiceDataset(Dataset):
 
 
 def load_boolq_examples(split: str) -> List[Dict[str, Any]]:
-    cache_file = f"boolq_{split}_examples.pt"
-
-    if os.path.exists(cache_file):
-        print(f"Loading BoolQ examples from {cache_file}...")
-        return torch.load(cache_file)
-
     print("Loading BoolQ from Hugging Face...")
     ds = load_dataset("boolq", split=split)
     print(f"Loaded raw BoolQ split with {len(ds)} examples")
@@ -292,9 +286,6 @@ def load_boolq_examples(split: str) -> List[Dict[str, Any]]:
                 "label": int(ex["answer"]),
             }
         )
-
-    torch.save(examples, cache_file)
-    print(f"Saved BoolQ examples to {cache_file}")
     return examples
 
 
@@ -897,7 +888,7 @@ def main():
     global_step = 0
 
     if args.resume_from_checkpoint is not None:
-        ckpt = torch.load(args.resume_from_checkpoint, map_location="cpu")
+        ckpt = torch.load(args.resume_from_checkpoint, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if ckpt.get("scheduler_state_dict") is not None:

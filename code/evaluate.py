@@ -47,6 +47,8 @@ def parse_args():
     parser.add_argument("--alpha", type=float, default=32.0)
     parser.add_argument("--load_in_4bit", action="store_true")
     parser.add_argument("--eval_all", action="store_true", help="Evaluate DoRA3 checkpoint across all datasets and print a table")
+    parser.add_argument("--eval_dora3_full", action="store_true", help="Evaluate DoRA3 on val+test for all datasets and print a full results table")
+    parser.add_argument("--eval_dora3_single", action="store_true", help="Evaluate DoRA3 on a single dataset (use --dataset) on val and test splits")
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--target_modules", nargs="*", default=None)
 
@@ -183,7 +185,7 @@ def run_one(label: str, method: str, ckpt_path: str, args, loader, device: torch
     print(f"[{label}] Loading checkpoint: {ckpt_path}")
     model = build_model(method=method, args=args, device=device, model_type=model_type, tokenizer=tokenizer)
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = _extract_state_dict(ckpt)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
@@ -217,7 +219,7 @@ ALL_DATASETS = ["boolq", "piqa", "siqa", "hellaswag", "winogrande", "arc_challen
 def evaluate_all_datasets(args, device, model_type, tokenizer):
     print(f"\nLoading DoRA3 model from {args.dora_checkpoint}...")
     model = build_model(method=args.dora_method, args=args, device=device, model_type=model_type, tokenizer=tokenizer)
-    ckpt = torch.load(args.dora_checkpoint, map_location="cpu")
+    ckpt = torch.load(args.dora_checkpoint, map_location="cpu", weights_only=False)
     state_dict = _extract_state_dict(ckpt)
     model.load_state_dict(state_dict, strict=False)
     model.eval()
@@ -259,6 +261,90 @@ def evaluate_all_datasets(args, device, model_type, tokenizer):
     return results
 
 
+def evaluate_dora3_full(args, device, model_type, tokenizer):
+    """Evaluate DoRA3 checkpoint on val and test splits for every dataset, print a full table."""
+    print(f"\nLoading DoRA3 checkpoint: {args.dora_checkpoint}")
+    model = build_model(method=args.dora_method, args=args, device=device, model_type=model_type, tokenizer=tokenizer)
+    ckpt = torch.load(args.dora_checkpoint, map_location="cpu", weights_only=False)
+    ckpt_meta = ckpt if isinstance(ckpt, dict) else {}
+    state_dict = _extract_state_dict(ckpt)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  Missing keys: {len(missing)}")
+    if unexpected:
+        print(f"  Unexpected keys: {len(unexpected)}")
+    model.eval()
+
+    saved_epoch = ckpt_meta.get("epoch", "?")
+    saved_step  = ckpt_meta.get("step", "?")
+    saved_args  = ckpt_meta.get("args", {})
+
+    if model_type == "causal":
+        _collate = lambda batch: collate_fn_causal(batch, tokenizer, args.max_length)
+    else:
+        _collate = lambda batch: collate_fn(batch, tokenizer, args.max_length)
+
+    def _eval_split(dataset, split):
+        try:
+            examples = resolve_eval_examples(dataset, split)
+            loader = DataLoader(
+                MultiChoiceDataset(examples),
+                batch_size=args.batch_size,
+                shuffle=False,
+                collate_fn=_collate,
+            )
+            return evaluate_model(model, loader, device, model_type=model_type)
+        except Exception as e:
+            return None
+
+    results = {}
+    for dataset in ALL_DATASETS:
+        print(f"  {dataset}: val...", end="", flush=True)
+        val_m = _eval_split(dataset, "validation")
+        print(f" acc={val_m['accuracy']:.4f}" if val_m else " FAILED", end="")
+        print(f"  test...", end="", flush=True)
+        test_m = _eval_split(dataset, "test")
+        print(f" acc={test_m['accuracy']:.4f}" if test_m else " N/A")
+        results[dataset] = {"val": val_m, "test": test_m}
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    W = 100
+    print("\n" + "=" * W)
+    print(f"  DoRA3 Results  |  checkpoint: {args.dora_checkpoint}")
+    print(f"  Epoch: {saved_epoch}  |  Step: {saved_step}  |  "
+          f"Rank: {saved_args.get('rank', args.rank)}  |  "
+          f"Alpha: {saved_args.get('alpha', args.alpha)}  |  "
+          f"LR: {saved_args.get('lr', args.lr)}  |  "
+          f"Model: {saved_args.get('model_name', args.model_name)}")
+    print("=" * W)
+    hdr = (f"{'Dataset':<18} "
+           f"{'Val Acc':>8} {'Val Loss':>9} {'Val N':>7}   "
+           f"{'Test Acc':>9} {'Test Loss':>10} {'Test N':>7}")
+    print(hdr)
+    print("-" * W)
+
+    val_accs, test_accs = [], []
+    for dataset in ALL_DATASETS:
+        v = results[dataset]["val"]
+        t = results[dataset]["test"]
+        val_str  = (f"{v['accuracy']:>8.4f} {v['loss']:>9.4f} {v['n_examples']:>7}"
+                    if v else f"{'N/A':>8} {'N/A':>9} {'N/A':>7}")
+        test_str = (f"{t['accuracy']:>9.4f} {t['loss']:>10.4f} {t['n_examples']:>7}"
+                    if t else f"{'N/A':>9} {'N/A':>10} {'N/A':>7}")
+        print(f"{dataset:<18} {val_str}   {test_str}")
+        if v:
+            val_accs.append(v["accuracy"])
+        if t:
+            test_accs.append(t["accuracy"])
+
+    print("-" * W)
+    val_avg  = f"{sum(val_accs)/len(val_accs):>8.4f}"  if val_accs  else f"{'N/A':>8}"
+    test_avg = f"{sum(test_accs)/len(test_accs):>9.4f}" if test_accs else f"{'N/A':>9}"
+    print(f"{'Average':<18} {val_avg} {'':>9} {'':>7}   {test_avg}")
+    print("=" * W)
+    return results
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -277,6 +363,32 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    if args.eval_dora3_full:
+        evaluate_dora3_full(args, device, model_type, tokenizer)
+        return
+
+    if args.eval_dora3_single:
+        if model_type == "causal":
+            _collate = lambda batch: collate_fn_causal(batch, tokenizer, args.max_length)
+        else:
+            _collate = lambda batch: collate_fn(batch, tokenizer, args.max_length)
+
+        print(f"\nLoading DoRA3 checkpoint: {args.dora_checkpoint}")
+        model = build_model(method=args.dora_method, args=args, device=device, model_type=model_type, tokenizer=tokenizer)
+        ckpt = torch.load(args.dora_checkpoint, map_location="cpu", weights_only=False)
+        model.load_state_dict(_extract_state_dict(ckpt), strict=False)
+        model.eval()
+
+        for split in ["validation", "test"]:
+            try:
+                examples = resolve_eval_examples(args.dataset, split)
+                loader = DataLoader(MultiChoiceDataset(examples), batch_size=args.batch_size, shuffle=False, collate_fn=_collate)
+                m = evaluate_model(model, loader, device, model_type=model_type)
+                print(f"[DoRA3 | {args.dataset} | {split}] acc={m['accuracy']:.4f} | loss={m['loss']:.4f} | n={m['n_examples']}")
+            except Exception as e:
+                print(f"[DoRA3 | {args.dataset} | {split}] N/A ({e})")
+        return
 
     if args.eval_all:
         evaluate_all_datasets(args, device, model_type, tokenizer)
