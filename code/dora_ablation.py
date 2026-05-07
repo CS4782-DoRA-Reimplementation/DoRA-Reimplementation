@@ -29,60 +29,76 @@ class DoRAAblation(nn.Module):
         if W.ndim != 2:
             raise ValueError("W must be a 2D weight matrix")
 
-        frozen_weight = W.detach().clone()
+        frozen_weight = W.detach().clone().float()
         self.register_buffer("W", frozen_weight)
         self.out_dim, self.in_dim = frozen_weight.shape
         self.rank = rank
         self.p = p
         self.alpha = alpha
+        self.scale = alpha / rank
         self.eps = eps
         self.detach_norm = detach_norm
 
-        row_norm = frozen_weight.norm(dim=1).clamp_min(eps)  # (output_dim,)
+        row_norm = frozen_weight.norm(p=2, dim=1).clamp_min(eps)  # (output_dim,)
         base_direction = frozen_weight / row_norm.unsqueeze(1)  # (output_dim, input_dim)
         self.register_buffer("base_direction", base_direction)
 
-        magnitude = row_norm.clone()  # (output_dim,)
+        magnitude = row_norm.clone()  # always float32 for stability
         if train_magnitude:
             self.magnitude = nn.Parameter(magnitude)
         else:
             self.register_buffer("magnitude", magnitude)
 
         if train_direction:
-            # Keep no-op adapter init: A zeros + random B => A @ B starts at 0.
-            self.A = nn.Parameter(torch.zeros(self.out_dim, rank))
-            self.B = nn.Parameter(torch.randn(rank, self.in_dim) * 0.01)
+            # No-op adapter init: B zeros + kaiming A => B @ A starts at 0,
+            # matching DoRA3 and avoiding initial fp16 overflow.
+            self.B = nn.Parameter(torch.zeros(self.out_dim, rank))
+            self.A = nn.Parameter(torch.empty(rank, self.in_dim))
+            nn.init.kaiming_uniform_(self.A, a=5 ** 0.5)
         else:
-            self.register_buffer("A", torch.zeros(self.out_dim, rank))
-            self.register_buffer("B", torch.zeros(rank, self.in_dim))
+            self.register_buffer("B", torch.zeros(self.out_dim, rank))
+            self.register_buffer("A", torch.zeros(rank, self.in_dim))
 
         self.dropout = nn.Dropout(p)
 
-    def _adapted_direction(self):
-        direction_update = (self.alpha / self.rank) * (self.A @ self.B)  # (output_dim, input_dim)
-        adapted = self.base_direction + direction_update
-        adapted_norm = adapted.norm(dim=1, keepdim=True).clamp_min(self.eps)  # (output_dim, 1)
+    def _adapted_norm_fp32(self, device):
+        # Compute the per-row norm of (W0_dir + delta_dir) entirely in fp32
+        A_f = self.A.float().to(device)
+        B_f = self.B.float().to(device)
+        base_dir = self.base_direction.to(device)
+        direction_update = self.scale * (B_f @ A_f)
+        adapted = base_dir + direction_update
+        norm = adapted.norm(p=2, dim=1, keepdim=True).clamp_min(self.eps)
         if self.detach_norm:
-            adapted_norm = adapted_norm.detach()
-        return adapted, adapted_norm
+            norm = norm.detach()
+        return norm  # fp32, shape (out_dim, 1)
 
     def effective_weight(self):
-        adapted, adapted_norm = self._adapted_direction()
-        return self.magnitude.unsqueeze(1) * (adapted / adapted_norm)
+        norm = self._adapted_norm_fp32(self.base_direction.device)
+        A_f = self.A.float()
+        B_f = self.B.float()
+        adapted = self.base_direction + self.scale * (B_f @ A_f)
+        return self.magnitude.unsqueeze(1) * (adapted / norm)
 
     def forward(self, x):
         if x.shape[-1] != self.in_dim:
             raise ValueError("x does not align with input dimension in DoRAAblation")
 
-        adapted, adapted_norm = self._adapted_direction()
-        magnitude_scale = self.magnitude / adapted_norm.squeeze(1)  # (output_dim,)
+        # All norm/magnitude math in fp32 to avoid fp16 overflow → NaN.
+        norm = self._adapted_norm_fp32(x.device)  # fp32, (out_dim, 1)
+        magnitude_fp32 = self.magnitude.to(x.device).float()
+        magnitude_scale_fp32 = magnitude_fp32 / norm.squeeze(1)  # fp32 (out_dim,)
+        magnitude_scale = magnitude_scale_fp32.to(x.dtype)
 
-        base_out = x @ self.base_direction.T  # (..., output_dim)
-        x_dropped = self.dropout(x)  # (..., input_dim)
-        delta_out = (x_dropped @ self.B.T) @ self.A.T  # (..., output_dim)
-        delta_out = (self.alpha / self.rank) * delta_out
+        base_direction = self.base_direction.to(device=x.device, dtype=x.dtype)
+        A = self.A.to(device=x.device, dtype=x.dtype)
+        B = self.B.to(device=x.device, dtype=x.dtype)
 
-        return (base_out + delta_out) * magnitude_scale.unsqueeze(0)
+        base_out = x @ base_direction.T  # (..., out_dim)
+        x_dropped = self.dropout(x)
+        delta_out = self.scale * (x_dropped @ A.T) @ B.T  # (..., out_dim)
+
+        return (base_out + delta_out) * magnitude_scale
 
 
 class DoRAFullAblation(DoRAAblation):

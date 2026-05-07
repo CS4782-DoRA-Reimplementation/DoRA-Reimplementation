@@ -21,6 +21,7 @@ from transformers import (
 from lora import LoRA
 from dora2 import DoRAPaper
 from dora3 import DoRA3
+from dora_ablation import DoRAFullAblation, DoRAFrozenMagnitude, DoRAMagnitudeOnly
 
 import time
 
@@ -48,7 +49,28 @@ def parse_args():
     # model / save
     parser.add_argument("--model_name", type=str, default="roberta-base")
     parser.add_argument("--model_type", type=str, choices=["encoder", "causal", "auto"], default="auto")
-    parser.add_argument("--method", type=str, choices=["lora", "dora3", "dora2", "both"], default="dora3")
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=[
+            "lora",
+            "dora3",
+            "dora2",
+            "dora_full",
+            "dora_frozen_magnitude",
+            "dora_magnitude_only",
+            "both",
+            "ablation",
+        ],
+        default="dora3",
+        help=(
+            "Adapter method. Use 'dora3' for the standard DoRA implementation. "
+            "Ablation variants: 'dora_full' (train magnitude + direction), "
+            "'dora_frozen_magnitude' (direction-only), "
+            "'dora_magnitude_only' (magnitude-only). "
+            "'ablation' runs all three ablation variants sequentially."
+        ),
+    )
     parser.add_argument("--save_dir", type=str, default="./checkpoints")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--seed", type=int, default=100)
@@ -142,6 +164,12 @@ class AdaptedLinear(nn.Module):
             self.adapter = DoRA3(W=W, rank=rank, p=dropout, alpha=alpha)
         elif method == "dora2":
             self.adapter = DoRAPaper(W=W, rank=rank, p=dropout, alpha=alpha)
+        elif method == "dora_full":
+            self.adapter = DoRAFullAblation(W=W, rank=rank, p=dropout, alpha=alpha)
+        elif method == "dora_frozen_magnitude":
+            self.adapter = DoRAFrozenMagnitude(W=W, rank=rank, p=dropout, alpha=alpha)
+        elif method == "dora_magnitude_only":
+            self.adapter = DoRAMagnitudeOnly(W=W, rank=rank, p=dropout, alpha=alpha)
         else:
             raise ValueError(f"Unknown method: {method}")
 
@@ -743,8 +771,12 @@ def load_val_examples_for_dataset(dataset_name: str) -> List[Dict[str, Any]]:
 def main():
     args = parse_args()
 
-    if args.method == "both":
-        for method in ["lora", "dora3"]:
+    if args.method in ("both", "ablation"):
+        if args.method == "both":
+            sweep = ["lora", "dora3"]
+        else:
+            sweep = ["dora_full", "dora_frozen_magnitude", "dora_magnitude_only"]
+        for method in sweep:
             cmd = [sys.executable] + sys.argv[:]
             idx = cmd.index("--method")
             cmd[idx + 1] = method
