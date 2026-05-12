@@ -19,8 +19,7 @@ from transformers import (
 )
 
 from lora import LoRA
-from dora2 import DoRAPaper
-from dora3 import DoRA3
+from dora import DoRA
 from dora_ablation import DoRAFullAblation, DoRAFrozenMagnitude, DoRAMagnitudeOnly
 
 import time
@@ -54,17 +53,16 @@ def parse_args():
         type=str,
         choices=[
             "lora",
-            "dora3",
-            "dora2",
+            "dora",
             "dora_full",
             "dora_frozen_magnitude",
             "dora_magnitude_only",
             "both",
             "ablation",
         ],
-        default="dora3",
+        default="dora",
         help=(
-            "Adapter method. Use 'dora3' for the standard DoRA implementation. "
+            "Adapter method. Use 'dora' for the standard DoRA implementation. "
             "Ablation variants: 'dora_full' (train magnitude + direction), "
             "'dora_frozen_magnitude' (direction-only), "
             "'dora_magnitude_only' (magnitude-only). "
@@ -125,7 +123,7 @@ class AdaptedLinear(nn.Module):
     LoRA:  output = base(x) + (alpha/rank) * (dropout(x) @ A.T) @ B.T
            Purely additive — W is never modified.
 
-    DoRA3: output = m * (W0 + delta) / ||W0 + delta|| @ x.T + bias
+    DoRA:  output = m * (W0 + delta) / ||W0 + delta|| @ x.T + bias
            Magnitude/direction decomposition per the DoRA paper.
     """
     def __init__(
@@ -160,10 +158,8 @@ class AdaptedLinear(nn.Module):
             self.A = nn.Parameter(torch.empty(rank, self.in_features))
             nn.init.kaiming_uniform_(self.A, a=5 ** 0.5)
             self.dropout = nn.Dropout(dropout)
-        elif method == "dora3":
-            self.adapter = DoRA3(W=W, rank=rank, p=dropout, alpha=alpha)
-        elif method == "dora2":
-            self.adapter = DoRAPaper(W=W, rank=rank, p=dropout, alpha=alpha)
+        elif method == "dora":
+            self.adapter = DoRA(W=W, rank=rank, p=dropout, alpha=alpha)
         elif method == "dora_full":
             self.adapter = DoRAFullAblation(W=W, rank=rank, p=dropout, alpha=alpha)
         elif method == "dora_frozen_magnitude":
@@ -773,7 +769,7 @@ def main():
 
     if args.method in ("both", "ablation"):
         if args.method == "both":
-            sweep = ["lora", "dora3"]
+            sweep = ["lora", "dora"]
         else:
             sweep = ["dora_full", "dora_frozen_magnitude", "dora_magnitude_only"]
         for method in sweep:

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-class DoRA3(nn.Module):
+class DoRA(nn.Module):
 
     def __init__(
         self,
@@ -32,7 +32,6 @@ class DoRA3(nn.Module):
 
         magnitude = W.float().norm(p=2, dim=1, keepdim=True).clamp_min(eps)
         self.magnitude = nn.Parameter(magnitude)  # always float32
-
 
         self.B = nn.Parameter(torch.zeros(self.out_dim, rank))
         self.A = nn.Parameter(torch.empty(rank, self.in_dim))
@@ -70,7 +69,3 @@ class DoRA3(nn.Module):
         lora_update = ((self.dropout(x) @ self.A.to(x.dtype).T) @ self.B.to(x.dtype).T) * self.scale
 
         return base + (magnitude_scale - 1.0) * base + magnitude_scale * lora_update
-
-
-DoRAPaperFixed = DoRA3
-DoRA = DoRA3
