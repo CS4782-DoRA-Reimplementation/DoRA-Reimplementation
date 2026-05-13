@@ -20,7 +20,7 @@ This corresponds to the original paper's magnitude-direction decomposition: free
 
 - `code/train.py`: training loop, dataset loading, adapter injection, checkpointing, and ablation runs.
 - `code/evaluate.py`: evaluation for single datasets or all 8 commonsense datasets.
-- `code/dora.py`, `code/dora2.py`, `code/dora_ablation.py`, `code/lora.py`: DoRA, LoRA, and ablation adapter implementations.
+- `code/dora.py`, `code/dora_ablation.py`, `code/lora.py`: DoRA, LoRA, and ablation adapter implementations.
 - `checkpoints/`: generated locally when training; model checkpoints are not included in the repo.
 
 ## Re-implementation Details
