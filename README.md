@@ -20,7 +20,7 @@ This corresponds to the original paper's magnitude-direction decomposition: free
 
 - `code/train.py`: training loop, dataset loading, adapter injection, checkpointing, and ablation runs.
 - `code/evaluate.py`: evaluation for single datasets or all 8 commonsense datasets.
-- `code/dora3.py`, `code/dora2.py`, `code/dora_ablation.py`, `code/lora.py`: DoRA, LoRA, and ablation adapter implementations.
+- `code/dora.py`, `code/dora2.py`, `code/dora_ablation.py`, `code/lora.py`: DoRA, LoRA, and ablation adapter implementations.
 - `checkpoints/`: generated locally when training; model checkpoints are not included in the repo.
 
 ## Re-implementation Details
@@ -47,7 +47,7 @@ Train DoRA on one dataset:
 python code/train.py \
   --model_name microsoft/phi-2 \
   --model_type causal \
-  --method dora3 \
+  --method dora \
   --dataset boolq \
   --rank 16 \
   --alpha 32 \
@@ -65,7 +65,7 @@ Train across all supported datasets:
 python code/train.py \
   --model_name microsoft/phi-2 \
   --model_type causal \
-  --method dora3 \
+  --method dora \
   --dataset all \
   --rank 16 \
   --alpha 32 \
@@ -83,8 +83,8 @@ Evaluate a checkpoint across all 8 datasets:
 python code/evaluate.py \
   --model_name microsoft/phi-2 \
   --model_type causal \
-  --dora_checkpoint checkpoints/dora3_all_best.pt \
-  --dora_method dora3 \
+  --dora_checkpoint checkpoints/dora_all_best.pt \
+  --dora_method dora \
   --rank 16 \
   --alpha 32 \
   --max_length 256 \
